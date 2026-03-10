@@ -15,7 +15,8 @@ from extreme_reasoning_model import ExtremeReasoningModel
 # 命令行参数
 parser = argparse.ArgumentParser()
 parser.add_argument("--data", type=str, default=None, help="训练数据文件 (jsonl格式)")
-parser.add_argument("--batch_size", type=int, default=16)  # 增大以提高 GPU 利用率
+parser.add_argument("--batch_size", type=int, default=4)  # 减小以节省显存
+parser.add_argument("--gradient_accumulation", type=int, default=8, help="梯度累积步数")
 parser.add_argument("--seq_len", type=int, default=256)
 parser.add_argument("--learning_rate", type=float, default=1e-4)  # 降低学习率
 parser.add_argument("--max_steps", type=int, default=10000)  # 大幅增加训练步数
@@ -162,7 +163,14 @@ model = ExtremeReasoningModel(
     max_seq_len=args.seq_len + 100,
 ).to(device)
 
-# mamba-ssm 已经有 CUDA 优化，不需要 torch.compile
+# 优化1: Gradient Checkpointing (时间换空间)
+if hasattr(model, 'gradient_checkpointing_enable'):
+    model.gradient_checkpointing_enable()
+elif hasattr(model, 'enable_gradient_checkpointing'):
+    model.enable_gradient_checkpointing()
+print("Gradient Checkpointing: 开启 (用时间换显存)")
+
+# 混合精度训练 (BF16) - 已经在用 AMP
 
 optimizer = AdamW(
     model.parameters(),
@@ -229,10 +237,11 @@ if args.dry_run:
     print("=== Dry Run 完成 ===")
     exit(0)
 
+accumulation_steps = args.gradient_accumulation
+print(f"梯度累积: {accumulation_steps} 步 (batch_size={args.batch_size}, 有效={args.batch_size * accumulation_steps})")
+
 for batch in train_loader:
     inputs, targets = [t.to(device) for t in batch]
-
-    optimizer.zero_grad(set_to_none=True)
 
     with amp.autocast(device_type='cuda'):
         logits = model(inputs)  # [b, seq, vocab]
@@ -241,13 +250,17 @@ for batch in train_loader:
             targets.view(-1),
             ignore_index=-100,
         )
+        loss = loss / accumulation_steps  # 归一化损失
 
     scaler.scale(loss).backward()
-    scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
-    scaler.step(optimizer)
-    scaler.update()
-    scheduler.step()
+
+    if (step + 1) % accumulation_steps == 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+        scheduler.step()
 
     step += 1
 
