@@ -14,6 +14,7 @@ from extreme_reasoning_model import ExtremeReasoningModel
 
 # 命令行参数
 parser = argparse.ArgumentParser()
+parser.add_argument("--data", type=str, default=None, help="训练数据文件 (jsonl格式)")
 parser.add_argument("--batch_size", type=int, default=16)  # 增大以提高 GPU 利用率
 parser.add_argument("--seq_len", type=int, default=256)
 parser.add_argument("--learning_rate", type=float, default=1e-4)  # 降低学习率
@@ -22,6 +23,8 @@ parser.add_argument("--warmup_steps", type=int, default=200)  # 调整 warmup
 parser.add_argument("--weight_decay", type=float, default=0.1)
 parser.add_argument("--grad_clip", type=float, default=1.0)
 parser.add_argument("--data_repeat", type=int, default=50)  # 增加数据重复次数
+parser.add_argument("--resume", action="store_true", help="从 checkpoint 恢复训练")
+parser.add_argument("--checkpoint", type=str, default="checkpoint.pt", help="checkpoint 文件路径")
 parser.add_argument("--dry_run", action="store_true", help="仅测试几个 batch 后退出")
 args = parser.parse_args()
 
@@ -34,34 +37,59 @@ if device == "cuda":
 # Tokenizer (GPT-2 BPE)
 enc = tiktoken.get_encoding("gpt2")
 
-# 从 train_data 文件夹读取所有 .md 文件
-data_dir = "train_data"
-md_files = sorted(glob.glob(os.path.join(data_dir, "*.md")))
-print(f"找到 {len(md_files)} 个训练数据文件:")
+# 读取训练数据
+import json
 
-text_parts = []
-for f in md_files:
-    with open(f, "r", encoding="utf-8") as file:
-        content = file.read().strip()
-        if content:
-            text_parts.append(content)
-            print(f"  - {os.path.basename(f)}: {len(content)} chars")
+if args.data and args.data.endswith('.jsonl'):
+    # JSONL 格式: question + reasoning + answer
+    print(f"从 JSONL 文件加载: {args.data}")
+    with open(args.data, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
 
-# 合并所有数据，重复以增加数据量
-text = "\n\n".join(text_parts) * args.data_repeat
+    problems = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        data = json.loads(line)
+        # 格式: 问题\n推理\n答案
+        q = data.get('question', '')
+        r = data.get('reasoning', '')
+        a = data.get('answer', '')
+        if q and a:
+            problem = f"{q}\n\n{r}\n\n{a}"
+            problems.append(problem)
 
-tokens = enc.encode(text)
-print(f"数据集 token 数量: {len(tokens)}")
+    print(f"从 JSONL 加载 {len(problems)} 条数据")
 
+else:
+    # 从 train_data 文件夹读取所有 .md 文件
+    data_dir = "train_data"
+    md_files = sorted(glob.glob(os.path.join(data_dir, "*.md")))
+    print(f"找到 {len(md_files)} 个训练数据文件:")
 
-# 直接用问题作为独立样本，不做滑动窗口
-import re
+    text_parts = []
+    for f in md_files:
+        with open(f, "r", encoding="utf-8") as file:
+            content = file.read().strip()
+            if content:
+                text_parts.append(content)
+                print(f"  - {os.path.basename(f)}: {len(content)} chars")
 
-# 合并原始数据（不重复）
-raw_text = "\n\n".join(text_parts)
-# 按问题分割
-problems = re.split(r'\*\*\d+\.\*\*', raw_text)
-problems = [p.strip() for p in problems if p.strip()]
+    # 合并所有数据，重复以增加数据量
+    text = "\n\n".join(text_parts) * args.data_repeat
+
+    tokens = enc.encode(text)
+    print(f"数据集 token 数量: {len(tokens)}")
+
+    # 直接用问题作为独立样本，不做滑动窗口
+    import re
+
+    # 合并原始数据（不重复）
+    raw_text = "\n\n".join(text_parts)
+    # 按问题分割
+    problems = re.split(r'\*\*\d+\.\*\*', raw_text)
+    problems = [p.strip() for p in problems if p.strip()]
 
 # 对每个问题编码为独立样本
 problem_tokens_list = [enc.encode(p) for p in problems]
@@ -123,16 +151,18 @@ val_loader = DataLoader(
 
 print(f"训练集: {len(train_dataset)} 样本, 验证集: {len(val_dataset)} 样本")
 
-# 模型
+# 模型 (~35M 参数)
 model = ExtremeReasoningModel(
     vocab_size=enc.n_vocab,
-    d_model=512,
-    n_layers=12,
+    d_model=512,    # 35M
+    n_layers=8,    # 35M
     n_heads=8,
     d_state=64,
     expand=2,
     max_seq_len=args.seq_len + 100,
 ).to(device)
+
+# mamba-ssm 已经有 CUDA 优化，不需要 torch.compile
 
 optimizer = AdamW(
     model.parameters(),
@@ -140,6 +170,16 @@ optimizer = AdamW(
     betas=(0.9, 0.95),
     weight_decay=args.weight_decay
 )
+
+# 断点续训
+if args.resume and os.path.exists(args.checkpoint):
+    print(f"加载 checkpoint: {args.checkpoint}")
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    model.load_state_dict(checkpoint['model'])
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    scheduler.load_state_dict(checkpoint['scheduler'])
+    step = checkpoint.get('step', 0)
+    print(f"从 step {step} 恢复训练")
 
 # 学习率调度器: Warmup + Cosine Annealing
 def lr_lambda(step):
@@ -230,3 +270,14 @@ for batch in train_loader:
         break
 
 print("训练完成！")
+
+# 保存完整 checkpoint（包含模型、优化器、调度器状态）
+checkpoint = {
+    'model': model.state_dict(),
+    'optimizer': optimizer.state_dict(),
+    'scheduler': scheduler.state_dict(),
+    'step': step,
+    'best_val_loss': best_val_loss,
+}
+torch.save(checkpoint, args.checkpoint)
+print(f"Checkpoint 已保存: {args.checkpoint}")

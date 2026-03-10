@@ -96,3 +96,36 @@ training_data.py
 - Supports causal masking for autoregressive generation
 - RoPE currently cached for max_seq_len=2048 (can be extended to 128K)
 - Hardware: CMP 90HX (10G VRAM) / RTX 3080 for training
+
+## Training Data Strategy (方案3: 增量训练)
+
+### 背景
+- 当前数据: 2917 条
+- seq_len=512 只能用 700 条
+- 目标: 利用全部数据训练
+
+### 确认方案
+| 选项 | 选择 |
+|------|------|
+| 1. 数据分割 | B - 按数量分，每批700条 |
+| 2. 训练流程 | C - 训练N轮后自动停止 |
+| 3. 断点续训 | C - 保存完整训练状态 |
+
+### 具体设计
+```
+数据: 2917条
+├── part1.jsonl (700条)
+├── part2.jsonl (700条)
+├── part3.jsonl (700条)
+└── part4.jsonl (117条)
+
+训练流程:
+- 每批训练 10000 步
+- 4批完成后自动停止
+- 每批结束保存完整 checkpoint
+```
+
+### 待实现
+- 数据分割脚本
+- 自动轮询训练脚本
+- 断点续训功能
